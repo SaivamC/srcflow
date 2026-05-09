@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srcflow"
-version = "0.3.0"
+version = "0.4.0"
 description = "Dependency flow visualizer for JS/TS/Python/Go/Rust/Java/C++ and more"
 requires-python = ">=3.9"
 authors = [{ name = "Saivamsi Chakrala", email = "chakralasaivamsi2003@gmail.com" }]

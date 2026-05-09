@@ -210,9 +210,78 @@ _R_SOURCE_RE    = re.compile(r"""source\s*\(\s*['"]([^'"]+)['"]""")
 
 _SWIFT_IMPORT_RE = re.compile(r'^\s*import\s+(\w+)', re.MULTILINE)
 
+# ── TS/JS path alias reader ───────────────────────────────────────────────────
+
+def read_ts_aliases(root: Path) -> dict:
+    """Read tsconfig.json compilerOptions.paths → {alias_prefix: resolved_dir}."""
+    aliases = {}
+    # Search root and one level deep (monorepos have tsconfig in sub-packages)
+    candidates = [root / "tsconfig.json"]
+    for sub in root.iterdir() if root.is_dir() else []:
+        if sub.is_dir():
+            for deep in [sub / "tsconfig.json", sub / "tsconfig.base.json"]:
+                candidates.append(deep)
+    candidates.append(root / "tsconfig.base.json")
+
+    for tsconfig in candidates:
+        if not tsconfig.is_file():
+            continue
+        try:
+            data = json.loads(tsconfig.read_text(errors="replace"))
+            co   = data.get("compilerOptions", {})
+            base_url = (tsconfig.parent / co.get("baseUrl", ".")).resolve()
+            for alias, targets in co.get("paths", {}).items():
+                prefix = alias.rstrip("/*")
+                if targets:
+                    target_rel = targets[0].rstrip("/*")
+                    aliases[prefix] = (base_url / target_rel).resolve()
+        except Exception:
+            pass
+
+    # Fallback common aliases if not found in tsconfig
+    for prefix in ("@", "~", "#"):
+        if prefix not in aliases:
+            for cand in [root / "src", root / "app", root / "lib", root]:
+                if cand.is_dir():
+                    aliases[prefix] = cand.resolve()
+                    break
+    return aliases
+
+# ── Monorepo drill-through: find the first level with meaningful structure ────
+
+def _find_top_dirs(files: list, root_abs: Path, src_parts: tuple):
+    """
+    Drills down through single-directory levels (e.g. apps/web/src/...)
+    until we find a level with multiple dirs OR bucket-matching dir names.
+    Returns (top_dirs set, extra_depth int).
+    """
+    for depth in range(6):
+        dirs = set()
+        for f in files:
+            parts = f.resolve().relative_to(root_abs).parts
+            idx = len(src_parts) + depth
+            if idx < len(parts) - 1:      # not the file itself
+                dirs.add(parts[idx])
+        if not dirs:
+            return dirs, depth
+        if len(dirs) > 1:
+            return dirs, depth
+        if len(dirs) == 1 and bucket_for(next(iter(dirs))) < 99:
+            return dirs, depth
+        # single unrecognised dir — drill one level deeper
+    return dirs, depth
+
 # ── Per-language resolvers ────────────────────────────────────────────────────
 
-def _resolve_rel_js(src: Path, spec: str, exts: tuple):
+def _resolve_rel_js(src: Path, spec: str, exts: tuple, aliases: dict):
+    # Try alias prefixes first (e.g. @/components/foo → src/components/foo)
+    for prefix, target_dir in aliases.items():
+        if spec == prefix or spec.startswith(prefix + "/"):
+            rel  = spec[len(prefix):].lstrip("/")
+            base = target_dir / rel if rel else target_dir
+            for c in [base] + [base.with_suffix(e) for e in exts] + [base / f"index{e}" for e in exts]:
+                r = c.resolve()
+                if r.is_file(): return r
     if not spec.startswith("."): return None
     base = src.parent / spec
     for c in [base] + [base.with_suffix(e) for e in exts] + [base / f"index{e}" for e in exts]:
@@ -324,7 +393,8 @@ def _resolve_lua(spec: str, src: Path, src_root: Path, root: Path) -> Path | Non
 
 # ── Main import dispatcher ─────────────────────────────────────────────────────
 
-def get_imports(p: Path, all_exts: tuple, src_root: Path, root: Path) -> list:
+def get_imports(p: Path, all_exts: tuple, src_root: Path, root: Path,
+                aliases: dict = None) -> list:
     try:
         text = p.read_text(errors="replace")
     except Exception:
@@ -332,12 +402,13 @@ def get_imports(p: Path, all_exts: tuple, src_root: Path, root: Path) -> list:
 
     ext = p.suffix.lower()
     results = []
+    _aliases = aliases or {}
 
     # ── JS / TS / Vue / Svelte ───────────────────────────────────────────────
     if ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"}:
         specs = [m.group(1) for m in _JS_IMPORT_RE.finditer(text)]
         specs += [m.group(1) for m in _JS_REQUIRE_RE.finditer(text)]
-        return [r for s in specs if (r := _resolve_rel_js(p, s, all_exts))]
+        return [r for s in specs if (r := _resolve_rel_js(p, s, all_exts, _aliases))]
 
     # ── Python ───────────────────────────────────────────────────────────────
     elif ext == ".py":
@@ -479,19 +550,21 @@ def build(root: Path, src_root: Path):
     abs_to_id = {f.resolve(): str(f.resolve().relative_to(root_abs)) for f in files}
     abs_set   = set(abs_to_id)
 
-    top_dirs = set()
-    for f in files:
-        rel = f.resolve().relative_to(root_abs)
-        stripped = rel.parts[len(src_parts):]
-        if stripped: top_dirs.add(stripped[0])
+    # Read TS/JS path aliases (handles @/, ~/, and tsconfig paths)
+    aliases = read_ts_aliases(root_abs)
+
+    # Drill through wrapper dirs (monorepos: apps/web/src/...) to find real structure
+    top_dirs, extra_depth = _find_top_dirs(files, root_abs, src_parts)
     col_of, layer_meta = assign_columns(sorted(top_dirs))
+
+    eff_depth = len(src_parts) + extra_depth   # total parts to skip before module dirs
 
     nodes = {}
     for f in files:
         fabs      = f.resolve()
         fid       = abs_to_id[fabs]
-        rel_parts = Path(fid).parts
-        stripped  = rel_parts[len(src_parts):]
+        all_parts = fabs.relative_to(root_abs).parts
+        stripped  = all_parts[eff_depth:]
         top_dir   = stripped[0] if stripped else "root"
         layer_idx = col_of.get(top_dir, max(col_of.values(), default=0))
         grp = stripped[1] if len(stripped) > 2 else stripped[0] if stripped else "root"
@@ -500,7 +573,7 @@ def build(root: Path, src_root: Path):
     seen, edges = set(), []
     for f in files:
         fid = abs_to_id[f.resolve()]
-        for dep in get_imports(f, all_exts, src_root, root_abs):
+        for dep in get_imports(f, all_exts, src_root, root_abs, aliases):
             if dep in abs_set and dep != f.resolve():
                 dep_id = abs_to_id[dep]
                 k = (fid, dep_id)
