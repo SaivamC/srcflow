@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-depflow — Dependency Flow Visualizer for any JS/TS/JSX/TSX repo.
+srcflow — Dependency Flow Visualizer for JS/TS/JSX/TSX/Python repos.
 
 Usage:
-  python3 depflow.py                       # current dir  -> ./depflow.html
-  python3 depflow.py /path/to/repo         # specific repo
-  python3 depflow.py /path/to/repo --out /tmp/out.html
-
-Install globally (one-time setup):
-  cp depflow.py ~/.local/bin/depflow
-  chmod +x ~/.local/bin/depflow
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
-  # then from any repo: depflow  OR  depflow /path/to/other-repo
+  srcflow                          # current dir  -> ./depflow.html
+  srcflow /path/to/repo            # specific repo
+  srcflow /path/to/repo --out /tmp/out.html
+  srcflow /path/to/repo --src /path/to/repo/src
 """
 
 import re, json, sys, argparse
@@ -20,7 +15,7 @@ from pathlib import Path
 # ── CLI args ───────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Dep-flow visualizer for JS/TS repos")
+    p = argparse.ArgumentParser(description="Dependency flow visualizer for JS/TS/Python repos")
     p.add_argument("repo", nargs="?", default=".",
                    help="Repo root path (default: current dir)")
     p.add_argument("--out", default=None,
@@ -32,16 +27,27 @@ def parse_args():
 # ── Skip rules ─────────────────────────────────────────────────────────────────
 
 SKIP_DIRS = {
+    # JS/TS
     "node_modules","__tests__","tests","test","__mocks__","mocks",
     "coverage","dist","build","out",".next",".nuxt","vendor",
     "fixtures","stubs","e2e","cypress",".cache",".turbo",
+    # Python
+    "__pycache__","venv",".venv","env",".tox","site-packages",
+    ".eggs","egg-info",
 }
 TEST_SUFFIXES = (
     ".test.js",".spec.js",".test.ts",".spec.ts",
     ".test.jsx",".spec.jsx",".test.tsx",".spec.tsx",
     ".unit.test.js",".unit.test.ts",
 )
-SOURCE_EXTS = {".js",".jsx",".ts",".tsx",".mjs",".cjs"}
+SOURCE_EXTS = {".js",".jsx",".ts",".tsx",".mjs",".cjs",".py"}
+
+def is_test_file(p: Path) -> bool:
+    if any(p.name.endswith(s) for s in TEST_SUFFIXES):
+        return True
+    if p.suffix == ".py" and (p.name.startswith("test_") or p.name.endswith("_test.py")):
+        return True
+    return False
 
 # ── Source-root detection ──────────────────────────────────────────────────────
 
@@ -56,11 +62,18 @@ def find_src_root(root: Path) -> Path:
 
 # (priority, display_name, keyword fragments that map to this column)
 BUCKETS = [
-    (0, "Model / Store",      ["model","models","store","stores","data","entity","entities","schema","db"]),
-    (1, "Pages / Views",      ["pages","views","screens","routes","page","view","screen","route"]),
-    (2, "Components",         ["components","component","widgets","widget","ui","elements","blocks"]),
-    (3, "Services / Effects", ["services","service","effects","effect","hooks","hook","api","actions","action","behaviors","behavior"]),
-    (4, "Utils / Constants",  ["utils","util","helpers","helper","lib","common","shared","constants","constant","config","runtime","types"]),
+    (0, "Model / Store",      ["model","models","store","stores","data","entity","entities",
+                                "schema","db","database","migrations","migration"]),
+    (1, "Pages / Views",      ["pages","views","screens","routes","page","view","screen","route",
+                                "templates","template","controllers","controller"]),
+    (2, "Components",         ["components","component","widgets","widget","ui","elements","blocks",
+                                "serializers","serializer","forms","form"]),
+    (3, "Services / Effects", ["services","service","effects","effect","hooks","hook","api",
+                                "actions","action","behaviors","behavior","tasks","task",
+                                "signals","signal","managers","manager","middleware"]),
+    (4, "Utils / Constants",  ["utils","util","helpers","helper","lib","common","shared",
+                                "constants","constant","config","runtime","types",
+                                "decorators","decorator","validators","validator"]),
 ]
 
 PALETTE = [
@@ -107,14 +120,21 @@ def all_source_files(src_root: Path) -> list:
         if not p.is_file(): continue
         if p.suffix not in SOURCE_EXTS: continue
         if any(d in p.parts for d in SKIP_DIRS): continue
-        if any(p.name.endswith(s) for s in TEST_SUFFIXES): continue
+        if is_test_file(p): continue
         files.append(p)
     return files
 
 # ── Import parsing ─────────────────────────────────────────────────────────────
 
+# JS/TS
 IMPORT_RE  = re.compile(r"""import\s+.*?from\s+['"]([^'"]+)['"]""", re.DOTALL)
 REQUIRE_RE = re.compile(r"""require\(\s*['"]([^'"]+)['"]\s*\)""")
+
+# Python: captures the module spec from 'from X import ...' or 'import X'
+PY_IMPORT_RE = re.compile(
+    r'^\s*(?:from\s+(\S+)\s+import|import\s+(\S+))',
+    re.MULTILINE
+)
 
 def resolve_rel(src: Path, spec: str, exts: tuple):
     if not spec.startswith("."): return None
@@ -124,12 +144,43 @@ def resolve_rel(src: Path, spec: str, exts: tuple):
         if r.is_file(): return r
     return None
 
-def get_imports(p: Path, exts: tuple) -> list:
+def resolve_py(src: Path, spec: str, src_root: Path, root: Path):
+    if spec.startswith("."):
+        dots = len(spec) - len(spec.lstrip("."))
+        module = spec.lstrip(".")
+        base = src.parent
+        for _ in range(dots - 1):
+            base = base.parent
+        parts = module.split(".") if module else []
+        candidate = base.joinpath(*parts) if parts else base
+        for c in [candidate.with_suffix(".py"), candidate / "__init__.py"]:
+            r = c.resolve()
+            if r.is_file(): return r
+    else:
+        parts = spec.split(".")
+        for base in [src_root, root]:
+            candidate = base.joinpath(*parts)
+            for c in [candidate.with_suffix(".py"), candidate / "__init__.py"]:
+                r = c.resolve()
+                if r.is_file(): return r
+    return None
+
+def get_imports(p: Path, exts: tuple, src_root: Path, root: Path) -> list:
     try: text = p.read_text(errors="replace")
     except Exception: return []
-    specs = [m.group(1) for m in IMPORT_RE.finditer(text)]
-    specs += [m.group(1) for m in REQUIRE_RE.finditer(text)]
-    return [r for s in specs if (r := resolve_rel(p, s, exts))]
+
+    if p.suffix == ".py":
+        results = []
+        for m in PY_IMPORT_RE.finditer(text):
+            spec = (m.group(1) or m.group(2) or "").split()[0].strip()
+            if not spec: continue
+            r = resolve_py(p, spec, src_root, root)
+            if r: results.append(r)
+        return results
+    else:
+        specs = [m.group(1) for m in IMPORT_RE.finditer(text)]
+        specs += [m.group(1) for m in REQUIRE_RE.finditer(text)]
+        return [r for s in specs if (r := resolve_rel(p, s, exts))]
 
 # ── Build graph ────────────────────────────────────────────────────────────────
 
@@ -137,7 +188,7 @@ def build(root: Path, src_root: Path):
     exts       = tuple(sorted(SOURCE_EXTS))
     files      = all_source_files(src_root)
     if not files:
-        print(f"No JS/TS source files found in {src_root}", file=sys.stderr); sys.exit(1)
+        print(f"No source files found in {src_root}", file=sys.stderr); sys.exit(1)
 
     root_abs   = root.resolve()
     src_parts  = src_root.resolve().relative_to(root_abs).parts
@@ -160,14 +211,13 @@ def build(root: Path, src_root: Path):
         stripped  = rel_parts[len(src_parts):]
         top_dir   = stripped[0] if stripped else "root"
         layer_idx = col_of.get(top_dir, max(col_of.values(), default=0))
-        # group = immediate subdir beneath top-level dir
         grp = stripped[1] if len(stripped) > 2 else stripped[0] if stripped else "root"
         nodes[fid] = {"id":fid,"label":f.name,"path":fid,"layer":layer_idx,"group":grp}
 
     seen, edges = set(), []
     for f in files:
         fid = abs_to_id[f.resolve()]
-        for dep in get_imports(f, exts):
+        for dep in get_imports(f, exts, src_root, root_abs):
             if dep in abs_set and dep != f.resolve():
                 dep_id = abs_to_id[dep]
                 k = (fid, dep_id)
@@ -413,7 +463,6 @@ for (const col of colMeta) {
   for (let gi = 0; gi < col.grpMeta.length; gi++) {
     const grp = col.grpMeta[gi];
     if (col.grpMeta.length === 1) continue;
-    // divider line before group (except first)
     if (gi > 0) {
       const div = mkEl('line', {
         x1: col.x - COL_PAD + 10, y1: grp.y - GRP_GAP/2,
@@ -422,7 +471,6 @@ for (const col of colMeta) {
       });
       glLayer.appendChild(div);
     }
-    // group name label
     const gl = mkEl('text', {
       x: col.x, y: grp.y - 3,
       fill: '#333855', 'font-size': '9',
@@ -506,9 +554,7 @@ function selectNode(id, doZoom) {
 
   nodeEls[id]?.rect.classList.add('selected');
 
-  // dim all edges
   for (const p of edgeLayer.children) p.classList.add('dim');
-  // highlight connected
   for (const t of dn) {
     const k=`${id}::${t}`;
     edgeEls[k]?.classList.remove('dim');
@@ -574,7 +620,6 @@ function setTransform(animated) {
   document.getElementById('zoom-level').textContent = Math.round(scale*100)+'%';
 }
 
-// Zoom toward a screen-space point (mx,my relative to canvas-wrap)
 function zoomAt(mx, my, factor) {
   const newScale = Math.max(0.15, Math.min(5, scale * factor));
   const ratio    = newScale / scale;
@@ -584,7 +629,6 @@ function zoomAt(mx, my, factor) {
   setTransform(false);
 }
 
-// ── Smooth animated zoom to a world-space bounding box ────────────────────────
 function animateTo(tvx, tvy, tsc) {
   const sx=vx, sy=vy, ss=scale;
   const t0=performance.now(), dur=340;
@@ -628,18 +672,15 @@ function fitAll() {
 
 // ── Input events ──────────────────────────────────────────────────────────────
 
-// Scroll to zoom at cursor (smooth on trackpad via deltaMode check)
 wrap.addEventListener('wheel', e => {
   e.preventDefault();
   const r=wrap.getBoundingClientRect();
   const mx=e.clientX-r.left, my=e.clientY-r.top;
-  // trackpad pinch sends small deltas; wheel sends large ones
   const delta = e.ctrlKey ? e.deltaY * 3 : e.deltaY;
   const factor = Math.exp(-delta * 0.0012);
   zoomAt(mx, my, factor);
 }, { passive:false });
 
-// Pinch-to-zoom (touch events)
 let lastPinchDist=null;
 wrap.addEventListener('touchstart', e => { if(e.touches.length===2) lastPinchDist=null; },{passive:true});
 wrap.addEventListener('touchmove', e => {
@@ -655,7 +696,6 @@ wrap.addEventListener('touchmove', e => {
   lastPinchDist=dist;
 },{passive:false});
 
-// Drag to pan
 wrap.addEventListener('mousedown', e => {
   if(e.target.closest('.node-g')) return;
   drag=true; dragSx=e.clientX-vx; dragSy=e.clientY-vy;
@@ -668,7 +708,6 @@ window.addEventListener('mousemove', e => {
 });
 window.addEventListener('mouseup', ()=>{ drag=false; wrap.classList.remove('panning'); });
 
-// Keyboard zoom
 window.addEventListener('keydown', e => {
   if(e.target===document.getElementById('search')) return;
   const r=wrap.getBoundingClientRect();
@@ -678,7 +717,6 @@ window.addEventListener('keydown', e => {
   if(e.key==='0')              { e.preventDefault(); fitAll(); }
 });
 
-// Buttons
 document.getElementById('btn-zoom-in') .addEventListener('click', ()=>{ const r=wrap.getBoundingClientRect(); zoomAt(r.width/2,r.height/2,1.25); });
 document.getElementById('btn-zoom-out').addEventListener('click', ()=>{ const r=wrap.getBoundingClientRect(); zoomAt(r.width/2,r.height/2,0.8); });
 document.getElementById('btn-fit')     .addEventListener('click', fitAll);
@@ -707,7 +745,6 @@ document.getElementById('search').addEventListener('keydown', e => {
   if(e.key==='Escape')   {e.target.value='';for(const n of NODES) nodeEls[n.id]?.rect.classList.remove('search-match');document.getElementById('match-info').textContent='';}
 });
 
-// pan-only (no zoom) when navigating search results
 function panToNode(id) {
   const pos=positions[id]; if(!pos) return;
   const r=wrap.getBoundingClientRect();

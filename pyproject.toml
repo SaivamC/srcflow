@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srcflow"
-version = "0.1.0"
-description = "Dependency flow visualizer for any JS/TS/JSX/TSX repository"
+version = "0.2.0"
+description = "Dependency flow visualizer for any JS/TS/JSX/TSX/Python repository"
 requires-python = ">=3.9"
 authors = [{ name = "Saivamsi Chakrala", email = "chakralasaivamsi2003@gmail.com" }]
 readme = "README.md"
