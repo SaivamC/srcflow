@@ -555,9 +555,18 @@ def build(root: Path, src_root: Path):
 
     # Drill through wrapper dirs (monorepos: apps/web/src/...) to find real structure
     top_dirs, extra_depth = _find_top_dirs(files, root_abs, src_parts)
-    col_of, layer_meta = assign_columns(sorted(top_dirs))
+    eff_depth = len(src_parts) + extra_depth
 
-    eff_depth = len(src_parts) + extra_depth   # total parts to skip before module dirs
+    if top_dirs:
+        col_of, layer_meta = assign_columns(sorted(top_dirs))
+    else:
+        # Flat folder — all files in one directory with no subdirs
+        folder_name = src_root.resolve().name or root_abs.name
+        col_of     = {"__flat__": 0}
+        layer_meta = [{"name": folder_name.replace("-", " ").title(),
+                       "color": PALETTE[0][0], "bg": PALETTE[0][1]}]
+
+    fallback_layer = max(col_of.values(), default=0)
 
     nodes = {}
     for f in files:
@@ -565,9 +574,9 @@ def build(root: Path, src_root: Path):
         fid       = abs_to_id[fabs]
         all_parts = fabs.relative_to(root_abs).parts
         stripped  = all_parts[eff_depth:]
-        top_dir   = stripped[0] if stripped else "root"
-        layer_idx = col_of.get(top_dir, max(col_of.values(), default=0))
-        grp = stripped[1] if len(stripped) > 2 else stripped[0] if stripped else "root"
+        top_dir   = stripped[0] if stripped else "__flat__"
+        layer_idx = col_of.get(top_dir, fallback_layer)
+        grp = stripped[1] if len(stripped) > 2 else stripped[0] if stripped else "__flat__"
         nodes[fid] = {"id": fid, "label": f.name, "path": fid, "layer": layer_idx, "group": grp}
 
     seen, edges = set(), []
